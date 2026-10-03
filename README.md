@@ -32,32 +32,58 @@
 - Node.js >= 22.6.0（OpenCode V2 環境已滿足）
 - `sqlite3` CLI（macOS 預設已安裝 `/usr/bin/sqlite3` 或 `sqlite3` 在 PATH）
 
-## 安裝方式
+## 安裝方式（給 LLM/AI 助理）
 
-### 方式 1：直接複製到 plugins 目錄（推薦）
+最簡單、最穩定的安裝方式是**直接從 GitHub 複製整個資料夾到 OpenCode plugins 目錄**。
+
+### 方式 1：Git Clone（推薦，支援未來更新）
 
 ```bash
-# 已複製至此路徑
-cp -R /Users/wclin/opencode/opencode_memv2 ~/.config/opencode/plugins/detmem
+mkdir -p ~/.config/opencode/plugins
+git clone https://github.com/wclinRD/opencode-memv2.git ~/.config/opencode/plugins/detmem
+opencode service restart
 ```
 
-或手動將 `detmem/` 資料夾整個複製到：
+### 方式 2：curl + tar（無需 git）
+
+```bash
+mkdir -p ~/.config/opencode/plugins/detmem
+curl -L https://github.com/wclinRD/opencode-memv2/archive/refs/heads/main.tar.gz | tar -xz -C /tmp
+cp -R /tmp/opencode-memv2-main/detmem/* ~/.config/opencode/plugins/detmem/
+rm -rf /tmp/opencode-memv2-main
+opencode service restart
+```
+
+### 方式 3：單一檔案安裝（最精簡）
+
+```bash
+mkdir -p ~/.config/opencode/plugins/detmem
+curl -L https://raw.githubusercontent.com/wclinRD/opencode-memv2/main/index.js -o ~/.config/opencode/plugins/detmem/index.js
+opencode service restart
+```
+
+### 方式 4：手動複製（本地開發）
+
+如果你已經下載此 repo 到本機：
+
+```bash
+cp -R /path/to/opencode-memv2/detmem ~/.config/opencode/plugins/
+opencode service restart
+```
+
+**安裝後確認**：
+
+```bash
+opencode plugin list | grep detmem
+```
+
+應該顯示：
 
 ```text
-~/.config/opencode/plugins/detmem/
+detmem  local  /Users/wclin/.config/opencode/plugins/detmem/index.js
 ```
 
-確保結構如下：
-
-```text
-~/.config/opencode/plugins/detmem/
-├── index.js
-└── README.md
-```
-
-### 方式 2：全域安裝（單一工作站）
-
-直接放在 `~/.config/opencode/plugins/` 底下，OpenCode V2 會自動掃描子資料夾與 `.js` 檔案。
+> OpenCode V2 會自動掃描 `~/.config/opencode/plugins/` 底下的 `.js` 檔案與子資料夾，載入後即自動生效。
 
 ## 設定
 
