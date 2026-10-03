@@ -1,402 +1,298 @@
 /**
- * OpenCode Deterministic Memory (detmem) — V2 plugin
- * - Zero LLM, deterministic capture
- * - Auto-capture on session.idle/compacted (raw transcript → SQLite FTS5)
- * - Rule-based fact extraction (decisions, todos, preferences, conventions)
- * - Optional local ONNX embeddings (semantic search) without generative AI
- * - Injects top-K relevant memories into chat context
+ * detmem — Deterministic Memory for OpenCode V2.
+ *
+ * Zero LLM. Captures the raw session transcript into SQLite (FTS5), extracts
+ * facts with fixed rules, and injects the most relevant memories ahead of each
+ * prompt.
+ *
+ * Every API below was ported from the V1 revision, which was silently inert.
+ * Two categories of change were needed, and both were established by measuring
+ * a live v2.0.20 server rather than by reading the SDK types:
+ *
+ *   Documented-but-wrong API surface
+ *     - ctx.config                            -> ctx.options
+ *     - ctx.event.subscribe(callback)         -> an AsyncIterable to `for await`
+ *     - ctx.tool.register                     -> ctx.tool.transform
+ *     - session events carry `.properties`    -> they carry `.data`
+ *     - session.idle is a real event          -> it is never emitted
+ *
+ *   Shape of the data itself
+ *     - ctx.session.context() returns a FLAT array of messages, not {info, parts}
+ *     - the role is `entry.type`, not `entry.info.role`
+ *     - user prose is on `entry.text`, assistant prose on `entry.content[].text`
+ *     - `time.created` is epoch milliseconds, not an ISO string
  */
 
-import { mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
-import { spawn } from "node:child_process";
 
-const DEFAULT_DB_DIR = path.join(os.homedir(), ".opencode-detmem");
-const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "detmem.sqlite");
+import {
+  buildFtsQuery,
+  buildLikeNeedle,
+  extractMessage,
+  formatContextBlock,
+  ruleExtractFacts,
+} from "./lib/extract.js";
+import {
+  DEFAULT_DB_PATH,
+  closeAll,
+  listFacts,
+  searchMemory,
+  stats,
+  storeFacts,
+  storeMessage,
+} from "./lib/sqlite.js";
 
-function nowIso() {
-  return new Date().toISOString();
+/**
+ * Events that mean "new transcript content is worth persisting".
+ *
+ * `session.idle` is declared in the SDK types but is never actually emitted by
+ * OpenCode v2 — measured over a live session, it fired zero times while
+ * `session.step.ended` fired on every step. The step boundary is therefore the
+ * real signal. `session.idle` is kept because it costs nothing and may be
+ * emitted by other code paths.
+ */
+const CAPTURE_EVENTS = new Set(["session.step.ended", "session.compacted", "session.idle"]);
+
+/**
+ * Coerce a model-supplied tool argument into a usable positive integer.
+ *
+ * SQLite binds `null` and `1.5` as-is and rejects them with "datatype mismatch",
+ * which the user would see as a failed tool call rather than a clamped result.
+ */
+function intArg(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(Math.floor(n), 200);
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+/**
+ * Pull the session ID out of an event.
+ *
+ * The published SDK types declare `{ type, properties }`, but the v2.0.20
+ * runtime actually delivers `{ id, created, type, durable, location, data }` —
+ * reading `event.properties` yields undefined and silently disables capture.
+ * `data` is checked first, `properties` second so a future version that matches
+ * the docs still works, and `durable.aggregateID` carries the same session ID.
+ */
+function sessionIdFromEvent(event) {
+  return (
+    event?.data?.sessionID ||
+    event?.properties?.sessionID ||
+    event?.durable?.aggregateID ||
+    null
+  );
 }
 
-async function ensureDir(p) {
-  if (!existsSync(p)) await mkdir(p, { recursive: true });
-}
+const NAMESPACE = "detmem";
+/** Collapse the many step boundaries inside one agentic turn into a single read. */
+const CAPTURE_DEBOUNCE_MS = 5000;
 
-async function runSqlite(dbPath, sql, params = []) {
-  const dbDir = path.dirname(dbPath);
-  await ensureDir(dbDir);
-  const args = ["-batch", "-cmd", ".mode json", dbPath];
-  const proc = spawn("sqlite3", args);
-  const input = sql + "\n";
-  proc.stdin.write(input);
-  proc.stdin.end();
-  let stdout = "";
-  let stderr = "";
-  proc.stdout.on("data", (d) => (stdout += d.toString()));
-  proc.stderr.on("data", (d) => (stderr += d.toString()));
-  return new Promise((resolve) => {
-    proc.on("close", (code) => {
-      if (code !== 0) return resolve({ ok: false, code, stderr, stdout });
-      try {
-        const rows = stdout.trim() ? JSON.parse(stdout) : [];
-        resolve({ ok: true, rows });
-      } catch (e) {
-        resolve({ ok: true, rows: [], raw: stdout });
-      }
-    });
-  });
-}
-
-async function initDb(dbPath) {
-  await ensureDir(path.dirname(dbPath));
-  const schema = `
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-
-CREATE TABLE IF NOT EXISTS transcripts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL,
-  title TEXT,
-  ts TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT NOT NULL,
-  tool TEXT,
-  synthetic INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id);
-CREATE INDEX IF NOT EXISTS idx_transcripts_ts ON transcripts(ts);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
-  content,
-  session_id UNINDEXED,
-  role UNINDEXED,
-  ts UNINDEXED,
-  tokenize = 'unicode61'
-);
-
-CREATE TABLE IF NOT EXISTS facts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL,
-  key TEXT NOT NULL,
-  value TEXT NOT NULL,
-  scope TEXT NOT NULL DEFAULT 'project',
-  project_dir TEXT,
-  confidence REAL NOT NULL DEFAULT 0.8,
-  ts TEXT NOT NULL,
-  sources TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_facts_kind ON facts(kind);
-CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(key);
-CREATE INDEX IF NOT EXISTS idx_facts_scope ON facts(scope);
-`;
-  await runSqlite(dbPath, schema);
-}
-
-function isSynthetic(part) {
-  if (!part) return true;
-  if (part.type === "thought" || part.type === "tool_call" || part.type === "tool_result") return true;
-  if (part.synthetic) return true;
-  return false;
-}
-
-function extractText(part) {
-  if (!part) return "";
-  if (part.type === "text") return part.text || "";
-  if (part.content) {
-    if (typeof part.content === "string") return part.content;
-    if (Array.isArray(part.content)) return part.content.map(extractText).join("\n");
-  }
-  if (part.text) return part.text;
-  return "";
-}
-
-function extractTool(part) {
-  if (!part) return null;
-  if (part.tool || part.name) return part.tool || part.name;
-  if (part.type === "tool_call") return part.tool || part.name || null;
-  return null;
-}
-
-function normalizeRole(r) {
-  if (!r) return "assistant";
-  const v = String(r).toLowerCase();
-  if (v === "human") return "user";
-  if (v === "thought") return "assistant";
-  return v;
-}
-
-function ruleExtractFacts(text) {
-  const facts = [];
-  if (!text) return facts;
-  const lines = text.split(/\r?\n/);
-  for (const line of lines) {
-    const mDec = line.match(/^(?:決定|Decision|DECISION)[:：]\s*(.+)$/i);
-    if (mDec) facts.push({ kind: "decision", key: mDec[1].trim().slice(0,80), value: mDec[1].trim(), confidence: 0.9 });
-    const mTodo = line.match(/^(?:TODO|待辦|ToDo)[:：]\s*(.+)$/i);
-    if (mTodo) facts.push({ kind: "todo", key: mTodo[1].trim().slice(0,60), value: mTodo[1].trim(), confidence: 0.85 });
-    const mPref = line.match(/^(?:偏好|Preference|偏愛)[:：]\s*(.+)$/i);
-    if (mPref) facts.push({ kind: "preference", key: mPref[1].trim().slice(0,60), value: mPref[1].trim(), confidence: 0.85 });
-    const mConv = line.match(/^(?:慣例|Convention|規則)[:：]\s*(.+)$/i);
-    if (mConv) facts.push({ kind: "convention", key: mConv[1].trim().slice(0,60), value: mConv[1].trim(), confidence: 0.88 });
-    const mUse = line.match(/(?:建議使用|use|採用)\s+([A-Za-z0-9_\-./@]+(?:\s*,\s*[A-Za-z0-9_\-./@]+)*)/i);
-    if (mUse && facts.length < 20) {
-      const v = mUse[1];
-      facts.push({ kind: "convention", key: v.slice(0,40), value: v, confidence: 0.7 });
-    }
-  }
-  return facts;
-}
-
-async function storeTranscript(dbPath, sessionId, title, msg) {
-  const role = normalizeRole(msg.role);
-  let fullText = "";
-  let tool = null;
-  let synthetic = 0;
-  if (Array.isArray(msg.parts)) {
-    for (const p of msg.parts) {
-      const t = extractText(p);
-      if (t) fullText += (fullText ? "\n" : "") + t;
-      const tl = extractTool(p);
-      if (tl) tool = tool || tl;
-      if (isSynthetic(p)) synthetic = 1;
-    }
-  } else if (msg.content) {
-    fullText = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-  }
-  fullText = fullText.trim();
-  if (!fullText) return { stored: 0 };
-  const ts = msg.timestamp ? new Date(msg.timestamp).toISOString() : nowIso();
-  const sql = `
-BEGIN TRANSACTION;
-INSERT INTO transcripts (session_id,title,ts,role,content,tool,synthetic) VALUES (?,?,?,?,?,?,?);
-INSERT INTO transcripts_fts (rowid, content, session_id, role, ts) VALUES (last_insert_rowid(), ?, ?, ?, ?);
-COMMIT;
-`;
-  const params = [
-    sessionId, title || null, ts, role, fullText, tool, synthetic,
-    fullText, sessionId, role, ts,
-  ];
-  await runSqlite(dbPath, sql, params);
-  return { stored: 1, text: fullText };
-}
-
-async function storeFacts(dbPath, facts, ctx) {
-  for (const f of facts) {
-    await runSqlite(
-      dbPath,
-      `INSERT INTO facts (kind,key,value,scope,project_dir,confidence,ts,sources) VALUES (?,?,?,?,?,?,?,?);`,
-      [f.kind, f.key, f.value, ctx.scope || "project", ctx.projectDir || null, f.confidence || 0.8, nowIso(), ctx.sessionId || null]
-    );
-  }
-  return facts.length;
-}
-
-async function searchRelevant(dbPath, query, limit = 8) {
-  if (!query) return { transcripts: [], facts: [] };
-  const q = query.replace(/["']/g, " ").trim();
-  let transcripts = [];
-  let facts = [];
-  if (q) {
-    const r1 = await runSqlite(
-      dbPath,
-      `SELECT snippet(transcripts_fts, 0, '【', '】', ' … ', 10) AS snip, session_id, ts, role
-       FROM transcripts_fts
-       WHERE transcripts_fts MATCH ?
-       ORDER BY bm25(transcripts_fts, 10.0, 1.0, 0.0, 0.0)
-       LIMIT ?;`,
-      [q, limit]
-    );
-    if (r1.ok) transcripts = r1.rows || [];
-    const r2 = await runSqlite(
-      dbPath,
-      `SELECT kind,key,value,confidence,ts FROM facts
-       WHERE value LIKE ? OR key LIKE ?
-       ORDER BY confidence DESC, ts DESC
-       LIMIT ?;`,
-      [`%${q}%`, `%${q}%`, limit]
-    );
-    if (r2.ok) facts = r2.rows || [];
-  }
-  return { transcripts, facts };
-}
-
-const lastCapture = new Map();
-async function captureSession(ctx, sessionId) {
-  const dbPath = ctx.config?.dbPath || ctx.options?.dbPath || DEFAULT_DB_PATH;
-  const now = Date.now();
-  if (sessionId) {
-    const k = sessionId;
-    if (lastCapture.has(k) && (now - lastCapture.get(k)) < 5 * 60 * 1000) {
-      return { ok: true, skipped: true, reason: "throttled" };
-    }
-    lastCapture.set(k, now);
-  }
-  await initDb(dbPath);
+/**
+ * Plugin console output never reaches ~/.local/share/opencode/log, so an
+ * opt-in file log is the only way to observe what the hooks are doing.
+ * Enable with the `debug` plugin option.
+ */
+function makeDebug(enabled, file) {
+  if (!enabled) return () => {};
   try {
-    if (!ctx.client?.session?.messages) return { ok: false, error: "ctx.client.session.messages not available" };
-    const res = await ctx.client.session.messages({ path: { id: sessionId } });
-    const msgs = res.messages || [];
-    let stored = 0;
-    let factsAll = [];
-    for (const m of msgs) {
-      const sr = await storeTranscript(dbPath, sessionId, res.title, m);
-      stored += sr.stored || 0;
-      if (sr.text) {
-        const ff = ruleExtractFacts(sr.text);
-        if (ff.length) factsAll.push(...ff);
-      }
-    }
-    if (factsAll.length) {
-      await storeFacts(dbPath, factsAll, { scope: "project", projectDir: process.cwd(), sessionId });
-    }
-    return { ok: true, stored, facts: factsAll.length };
-  } catch (e) {
-    return { ok: false, error: String(e) };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+  } catch {
+    return () => {};
   }
-}
-
-function formatContextBlock(relevant) {
-  const lines = ["# Deterministic Memory (detmem)"];
-  if (relevant.facts?.length) {
-    lines.push("## Facts (rule-based)");
-    for (const f of relevant.facts) {
-      lines.push(`- [${f.kind}] ${f.key}: ${f.value}`);
+  return (msg) => {
+    try {
+      fs.appendFileSync(file, `${new Date().toISOString()} ${msg}\n`);
+    } catch {
+      /* logging must never break the plugin */
     }
-  }
-  if (relevant.transcripts?.length) {
-    lines.push("## Relevant snippets (FTS5)");
-    for (const t of relevant.transcripts) {
-      lines.push(`- ${t.ts?.slice(0,19)} [${t.role}] ${t.snip}`);
-    }
-  }
-  if (lines.length === 1) return null;
-  return lines.join("\n");
+  };
 }
 
 export default {
   id: "detmem",
   name: "Deterministic Memory",
+
   async setup(ctx) {
-    const dbPath = ctx.config?.dbPath || ctx.options?.dbPath || DEFAULT_DB_PATH;
-    await initDb(dbPath);
+    const dbPath = ctx.options?.dbPath || DEFAULT_DB_PATH;
+    const projectDir = ctx.location?.project?.canonical || ctx.location?.directory || null;
+    const debug = makeDebug(
+      ctx.options?.debug === true,
+      ctx.options?.debugFile || path.join(path.dirname(dbPath), "detmem.log"),
+    );
 
-    // Auto-capture on session lifecycle events
-    try {
-      ctx.event.subscribe(async (ev) => {
-        try {
-          const t = ev?.event?.type || ev?.type || ev?.name;
-          if (t === "session.idle" || t === "session.compacted" || t === "session.updated" || t === "session.idle.changed" || t === "session.idle.update") {
-            const sid = ev?.event?.sessionID || ev?.event?.sessionId || ev?.sessionID || ev?.sessionId || ev?.properties?.sessionID || ev?.properties?.id || ev?.id;
-            if (sid) {
-              await captureSession(ctx, sid);
-            }
-          }
-        } catch (e) {}
-      });
-    } catch (e) {}
+    // Touch the DB once up front so schema problems surface at load time
+    // instead of silently on the first prompt.
+    stats(dbPath);
 
-    // Inject relevant memory before prompt
-    const lastInject = { q: "", ts: 0 };
-    try {
-      if (ctx.session?.hook) {
-        ctx.session.hook("prompt", async (input) => {
-          try {
-            const prompt = input.prompt || "";
-            const q = (prompt.slice(0, 160) || "").trim();
-            const now = Date.now();
-            if (q && q === lastInject.q && (now - lastInject.ts) < 60_000) {
-              return input;
-            }
-            const rel = await searchRelevant(dbPath, q, 8);
-            const block = formatContextBlock(rel);
-            if (block) {
-              input.prompt = block + "\n\n---\n\n" + prompt;
-              lastInject.q = q;
-              lastInject.ts = now;
-            }
-          } catch (e) {}
-          return input;
-        });
+    const titleBySession = new Map();
+    const lastCapture = new Map();
+
+    const capture = async (sessionId) => {
+      if (!sessionId) return;
+      const now = Date.now();
+      const previous = lastCapture.get(sessionId) || 0;
+      if (now - previous < CAPTURE_DEBOUNCE_MS) return;
+      lastCapture.set(sessionId, now);
+      // Drop the bookkeeping for sessions that have gone quiet, so neither map
+      // grows one entry per session for the lifetime of the process.
+      if (lastCapture.size > 500) {
+        for (const [key, at] of lastCapture) if (now - at > 10 * 60 * 1000) lastCapture.delete(key);
+        for (const key of titleBySession.keys()) {
+          if (now - (lastCapture.get(key) || 0) > 10 * 60 * 1000) titleBySession.delete(key);
+        }
       }
-    } catch (e) {}
 
-    // Manual tools
-    try {
-      ctx.tool.register({
-        id: "detmem.search",
-        description: "Search deterministic memory (FTS5 + facts)",
-        parameters: {
+      let entries;
+      try {
+        const session = await ctx.session.get({ sessionID: sessionId });
+        if (session?.title) titleBySession.set(sessionId, session.title);
+        entries = await ctx.session.context({ sessionID: sessionId });
+        debug(`capture ${sessionId}: ${entries?.length ?? 0} entries`);
+      } catch (err) {
+        debug(`capture ${sessionId} FAILED: ${String(err)}`);
+        return;
+      }
+
+      let stored = 0;
+      let facts = [];
+      for (const entry of entries || []) {
+        const message = extractMessage(entry);
+        if (!message.text) continue;
+        const result = storeMessage(dbPath, {
+          messageId: message.messageId,
+          sessionId,
+          title: titleBySession.get(sessionId) || null,
+          ts: message.ts,
+          role: message.role,
+          content: message.text,
+          tool: message.tool,
+          synthetic: message.synthetic,
+          projectDir,
+        });
+        if (result.stored) {
+          stored++;
+          facts.push(...ruleExtractFacts(result.text));
+        }
+      }
+
+      if (facts.length) {
+        try {
+          storeFacts(dbPath, facts, { scope: "project", projectDir, sessionId });
+        } catch (err) {
+          debug(`facts FAILED: ${String(err)}`);
+        }
+      }
+      debug(`capture ${sessionId}: stored ${stored}, facts ${facts.length}`);
+    };
+
+    // --- Events -------------------------------------------------------------
+    // V2 subscribe() returns an AsyncIterable; it must be consumed, not called.
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          // Only capture-relevant events are logged: the stream carries hundreds
+          // of token-delta events per turn, which would swamp the log.
+          if (!CAPTURE_EVENTS.has(event?.type)) continue;
+          const id = sessionIdFromEvent(event);
+          debug(`capture event type=${event.type} id=${id}`);
+          if (!id) continue;
+          // Per-event, not around the whole loop: a single failed capture (a locked
+          // database, a renamed project directory) must not end the subscription,
+          // which would silently stop all capture for the rest of the process.
+          try {
+            await capture(id);
+          } catch (err) {
+            debug(`capture ${id} threw: ${String(err)}`);
+          }
+        }
+        debug("event stream closed");
+      } catch (err) {
+        debug(`event stream error: ${String(err)}`);
+      }
+    })();
+
+    // --- Prompt hook --------------------------------------------------------
+    // Mutate event.prompt.text in place; returning a modified copy does nothing.
+    await ctx.session.hook("prompt", (event) => {
+      try {
+        const original = event?.prompt?.text;
+        debug(`prompt hook fired len=${typeof original === "string" ? original.length : "n/a"}`);
+        if (typeof original !== "string" || !original.trim()) return;
+        const query = original.slice(0, 160);
+        const relevant = searchMemory(dbPath, query, 8, buildFtsQuery(query), buildLikeNeedle(query));
+        const block = formatContextBlock(relevant);
+        if (!block) return;
+        if (original.startsWith(block)) return;
+        event.prompt.text = `${block}\n---\n\n${original}`;
+        debug(`prompt hook injected ${relevant.transcripts.length} snippet(s)`);
+      } catch (err) {
+        debug(`prompt hook FAILED: ${String(err)}`);
+      }
+    });
+
+    // --- Tools --------------------------------------------------------------
+    // Tool arguments come from a language model, so `limit` can arrive as null,
+    // a float or a string. SQLite binds those as-is and rejects them with
+    // "datatype mismatch", which would surface to the user as a failed tool call
+    // instead of a clamped result. Every value is coerced here, once.
+    // Names are prefixed explicitly rather than through an `editor.namespace()`
+    // call: that method is absent from every published SDK type, and measuring
+    // the live server showed it silently had no effect — the tools were exposed
+    // as bare `search` / `stats`, which would shadow same-named built-ins.
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: `${NAMESPACE}_search`,
+        description: "Full-text and fact search over captured session memory.",
+        input: {
           type: "object",
           properties: {
-            query: { type: "string" },
-            limit: { type: "number", default: 10 },
+            query: { type: "string", description: "Text to search for." },
+            limit: { type: "number", description: "Maximum results per source.", default: 8 },
           },
           required: ["query"],
+          additionalProperties: false,
         },
-        async execute({ query, limit = 10 }) {
-          const rel = await searchRelevant(dbPath, query, limit);
-          return { ok: true, ...rel };
+        execute: async ({ query, limit }) => {
+          const relevant = searchMemory(dbPath, query, intArg(limit, 8), buildFtsQuery(query), buildLikeNeedle(query));
+          const empty = relevant.transcripts.length === 0 && relevant.facts.length === 0;
+          return { content: empty ? "No matching memory." : JSON.stringify(relevant, null, 2) };
         },
       });
 
-      ctx.tool.register({
-        id: "detmem.list_facts",
-        description: "List rule-based facts",
-        parameters: {
+      editor.add({
+        name: `${NAMESPACE}_list_facts`,
+        description: "List rule-extracted facts (decisions, todos, preferences, conventions).",
+        input: {
           type: "object",
           properties: {
-            kind: { type: "string" },
-            limit: { type: "number", default: 20 },
+            kind: { type: "string", description: "decision | todo | preference | convention" },
+            limit: { type: "number", description: "Maximum rows.", default: 20 },
           },
+          additionalProperties: false,
         },
-        async execute({ kind, limit = 20 }) {
-          let sql = "SELECT id,kind,key,value,scope,confidence,ts FROM facts";
-          const params = [];
-          if (kind) { sql += " WHERE kind=?"; params.push(kind); }
-          sql += " ORDER BY ts DESC LIMIT ?";
-          params.push(limit);
-          const r = await runSqlite(dbPath, sql, params);
-          return { ok: r.ok, facts: r.rows || [] };
+        execute: async ({ kind, limit }) => {
+          const rows = listFacts(dbPath, { kind: kind || null, limit: intArg(limit, 20) });
+          return { content: rows.length ? JSON.stringify(rows, null, 2) : "No facts stored yet." };
         },
       });
 
-      ctx.tool.register({
-        id: "detmem.stats",
-        description: "Deterministic memory stats",
-        parameters: { type: "object", properties: {} },
-        async execute() {
-          const r1 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM transcripts;");
-          const r2 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM facts;");
-          return { ok: true, transcripts: r1.rows?.[0]?.c || 0, facts: r2.rows?.[0]?.c || 0, dbPath };
-        },
+      editor.add({
+        name: `${NAMESPACE}_stats`,
+        description: "Memory store statistics, including FTS index consistency.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        execute: async () => ({ content: JSON.stringify(stats(dbPath), null, 2) }),
       });
+    });
 
-      ctx.tool.register({
-        id: "detmem.cleanup",
-        description: "Cleanup old deterministic memory (by days)",
-        parameters: {
-          type: "object",
-          properties: {
-            days: { type: "number", default: 90, minimum: 1, maximum: 3650 },
-          },
-        },
-        async execute({ days = 90 }) {
-          const cutoff = new Date(Date.now() - days * 864e5).toISOString();
-          const dp = dbPath;
-          await runSqlite(dp, `DELETE FROM transcripts WHERE ts < ?;`, [cutoff]);
-          await runSqlite(dp, `DELETE FROM facts WHERE ts < ?;`, [cutoff]);
-          await runSqlite(dp, `INSERT INTO transcripts_fts(transcripts_fts) VALUES('optimize');`);
-          const r1 = await runSqlite(dp, "SELECT COUNT(*) AS c FROM transcripts;");
-          const r2 = await runSqlite(dp, "SELECT COUNT(*) AS c FROM facts;");
-          return { ok: true, cutoff, transcriptsAfter: r1.rows?.[0]?.c || 0, factsAfter: r2.rows?.[0]?.c || 0 };
-        },
-      });
-    } catch (e) {}
+    debug(`setup complete db=${dbPath} project=${projectDir}`);
+
+    return () => {
+      controller.abort();
+      // Release the SQLite handle; the schema is re-created on next setup.
+      closeAll();
+      debug("unloaded");
+    };
   },
 };

@@ -8,5 +8,10 @@
     "type": "git",
     "url": "git+https://github.com/wclinRD/opencode-memv2.git"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/",
+    "test:bun": "bun test test/",
+    "test:system": "DETMEM_SYS_TEST=1 node --test --test-timeout=300000 test/system.test.mjs"
+  }
 }

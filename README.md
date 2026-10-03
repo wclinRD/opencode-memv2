@@ -1,106 +1,26 @@
-# OpenCode Deterministic Memory (detmem) v2
+# detmem — Deterministic Memory for OpenCode V2
 
-一個 **OpenCode V2 專用**、**完全不需要 LLM（Zero LLM）** 的決定性記憶插件。
+一個 **Zero LLM** 的 OpenCode V2 記憶插件：自動把每個 session 的對話寫進本機 SQLite（FTS5），
+用固定正則抽出「決定 / TODO / 偏好 / 慣例」，並在下一次 prompt 前自動注入最相關的記憶。
 
-> 精準對應需求：自動捕捲 Session Transcript（決定性儲存）＋ 規則式 Facts 抽取（專案慣例/決策/TODO），提供 FTS5 全文檢索與自動 Context 注入。
+不呼叫任何 AI Provider、不消耗 token、離線可用，結果完全可預測。
 
-## 核心特色
+> 本 README 的每一項行為都在 **OpenCode v2.0.20** 上實測驗證過，不是照著文件推測的。
 
-- **Zero LLM / 決定性（Deterministic）** — 完全不呼叫任何 AI Provider、不消耗 Token、不依賴模型載入狀態，零延遲、完全離線。
-- **自動 Capture（Session Transcript）** — 訂閱 OpenCode V2 事件（`session.idle`、`session.compacted`、`session.updated`），自動讀取整個 Session 訊息並寫入 SQLite + FTS5。
-- **原始 Transcript 決定性儲存** — 儲存原始對話內容（過濾 `thought/tool_call/tool_result` synthetic 部分），可追溯「我之前做過什麼、當時選了什麼」。
-- **規則式 Facts 抽取** — 純正則式自動萃取 `決定`、`Decision`、`TODO`、`待辦`、`偏好`、`Preference`、`慣例`、`Convention`、`建議使用 ...` 等結構化事實。
-- **FTS5 全文檢索（BM25）** — 使用 SQLite FTS5 搭配 `bm25()` 排序，支援繁體中文關鍵字檢索，無需向量模型也有良好檢索體驗。
-- **自動 Context 注入** — `session.hook("prompt")` 在每次使用者 Prompt 前，自動根據 Prompt 前 120 字搜尋最相關的 Snippets 與 Facts，僅注入 Top-K，避免上下文膨脹。
-- **事件溯源 + 專案慣例** — 同時滿足「跨 Session 找回過去的決策」（事件溯源）與「自動帶入專案慣例/偏好」（結構化 Facts）。
+---
 
-## 與 opencode-mem 對比
+## 快速開始
 
-| 面向 | opencode-mem（tickernelz） | detmem（本插件） |
-|---|---|---|
-| **自動 Capture** | 需要 LLM（auto-capture 要求 AI Provider） | **完全不需要 LLM**（決定性事件驅動） |
-| **巢狀 Session 403（Free Tier）** | 容易觸發（plugin 內部合成 session） | **不會觸發**（不建立巢狀 LLM session，只讀取現有訊息） |
-| **延遲/穩定性** | 依賴模型回應（可能 10s–90s 逾時） | **即時/零延遲**（僅 DB 寫入） |
-| **離線可用** | 部分路徑需網路或本機模型常駐 | **完全離線** |
-| **儲存方式** | Turso/libSQL + 向量 | **SQLite + FTS5（純檔案、本機）** |
-| **結構化抽取** | LLM 摘要（非決定性） | **規則式 Facts（決定性、可預測）** |
-| **Context 注入** | 由 plugin 決定時機 | **`prompt` hook 自動注入**（可控、精準） |
+### 1. 安裝
 
-## 系統需求
-
-- OpenCode **v2.0.x**（已在 v2.0.20 驗證）
-- Node.js >= 22.6.0（OpenCode V2 環境已滿足）
-- `sqlite3` CLI（macOS 預設已安裝 `/usr/bin/sqlite3` 或 `sqlite3` 在 PATH）
-
-## 安裝方式（給 LLM/AI 助理）
-
-最簡單、最穩定的安裝方式是**直接從 GitHub 複製整個資料夾到 OpenCode plugins 目錄**。
-
-### 方式 1：Git Clone（推薦，支援未來更新）
-
-```bash
-mkdir -p ~/.config/opencode/plugins
-git clone https://github.com/wclinRD/opencode-memv2.git ~/.config/opencode/plugins/detmem
-opencode service restart
-```
-
-### 方式 2：curl + tar（無需 git）
-
-```bash
-mkdir -p ~/.config/opencode/plugins/detmem
-curl -L https://github.com/wclinRD/opencode-memv2/archive/refs/heads/main.tar.gz | tar -xz -C /tmp
-cp -R /tmp/opencode-memv2-main/detmem/* ~/.config/opencode/plugins/detmem/
-rm -rf /tmp/opencode-memv2-main
-opencode service restart
-```
-
-### 方式 3：單一檔案安裝（最精簡）
-
-```bash
-mkdir -p ~/.config/opencode/plugins/detmem
-curl -L https://raw.githubusercontent.com/wclinRD/opencode-memv2/main/index.js -o ~/.config/opencode/plugins/detmem/index.js
-opencode service restart
-```
-
-### 方式 4：手動複製（本地開發）
-
-如果你已經下載此 repo 到本機：
-
-```bash
-cp -R /path/to/opencode-memv2/detmem ~/.config/opencode/plugins/
-opencode service restart
-```
-
-**安裝後確認**：
-
-```bash
-opencode plugin list | grep detmem
-```
-
-應該顯示：
-
-```text
-detmem  local  /Users/wclin/.config/opencode/plugins/detmem/index.js
-```
-
-> OpenCode V2 會自動掃描 `~/.config/opencode/plugins/` 底下的 `.js` 檔案與子資料夾，載入後即自動生效。
-
-## 設定
-
-預設即可運作，無需額外設定。資料庫預設位置：
-
-```text
-~/.opencode-detmem/detmem.sqlite
-```
-
-如需自訂資料庫路徑，可在 `~/.config/opencode/opencode.jsonc` 加入：
+在 `~/.config/opencode/opencode.jsonc` 的 `plugins` 陣列加一筆（若尚未有 `plugins` 欄位請自行補上）：
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "id": "detmem",
+      "package": "/path/to/opencode-memv2",
       "options": {
         "dbPath": "/Users/wclin/.opencode-detmem/detmem.sqlite"
       }
@@ -109,105 +29,169 @@ detmem  local  /Users/wclin/.config/opencode/plugins/detmem/index.js
 }
 ```
 
-## 啟用插件
+`package` 可以是本機路徑（開發用）或 npm 套件名稱。
+**不要**把整個資料夾複製到 `~/.config/opencode/plugins/`——V2 只會掃描那個目錄下的 `.js`，
+複製進去的 `lib/*.js` 會被當成獨立外掛逐一載入而失敗。用 `plugins` 陣列指定專案根目錄即可。
 
-1. 複製插件到正確路徑
-2. 重新啟動 OpenCode 背景 Service
+若從 GitHub 安裝：
+
+```bash
+git clone https://github.com/wclinRD/opencode-memv2.git ~/opencode_memv2
+```
+
+### 2. 啟用
 
 ```bash
 opencode service restart
 ```
 
-3. 確認插件已載入
+確認載入（不應出現 `failed to load plugin`）：
 
 ```bash
-opencode plugin list
+grep 'msg="loading plugin"' ~/.local/share/opencode/log/opencode.log | tail -3
 ```
 
-應該出現：
+要看 detmem 自己的診斷訊息，得另外開 `options.debug`，因為外掛的 `console.error`
+**不會**寫進 `opencode.log`：
+
+```bash
+tail -f ~/.opencode-detmem/detmem.log
+```
+
+### 3. 確認運作
+
+在對話中輸入帶有結構化標記的內容：
 
 ```text
-detmem  local  /Users/wclin/.config/opencode/plugins/detmem/index.js
+決定：記憶庫改用 node:sqlite
+TODO：補上 system test
+慣例：每次改動都要 commit
 ```
 
-4. 重新啟動 OpenCode TUI（`Ctrl+Q` 或重新開啟終端機）
+接著問 `detmem_stats`，應該會看到 `transcripts > 0`、`facts > 0`。
 
-## 自動運作機制
+---
 
-插件啟用後會**自動**運作，不需要任何手動操作。
+## 需求
 
-| 事件 | 行為 |
+| 項目 | 需求 |
 |---|---|
-| `session.idle` | Session 閒置時自動捕捲整個 Transcript → 寫入 SQLite + FTS5 → 執行規則式 Facts 抽取 |
-| `session.compacted` | Compaction 時補抓，避免遺漏 |
-| `session.updated` | Fallback 保險觸發 |
-| 使用者送出 Prompt 前 | `prompt` hook 自動搜尋相關記憶（FTS5 + Facts），注入至 Prompt 最前方（`# Deterministic Memory (detmem)` 區塊） |
+| OpenCode | v2.0.x（實測 v2.0.20） |
+| Runtime | 內建 `node:sqlite`。Bun >= 1.4（OpenCode 內建的 Bun 已滿足）；若改用 Node 跑測試需 **>= 22.13.0**（`node:sqlite` 在 22.6 時還得加 `--experimental-sqlite`） |
+| 額外相依 | **無**。不需要 `sqlite3` CLI、不需要向量資料庫、不需要任何模型 |
 
-## 可用工具（Agent Tools）
+---
 
-插件註冊了 3 個 Tool，可在對話中直接呼叫：
+## 運作機制
 
-| Tool | 參數 | 說明 |
+| 時機 | 行為 |
+|---|---|
+| `session.step.ended`（5 秒 debounce） | 讀取 `ctx.session.context({ sessionID })` 全部訊息 → 寫入 `transcripts` + FTS5 → 執行規則式 Facts 抽取 |
+| 使用者 prompt 送出前 | `prompt` hook 以 prompt 前 160 字檢索，將 Top-K 事實與片段注入 prompt 最前面 |
+| 外掛卸載 | 取消事件訂閱，並關閉 SQLite handle（下次 `getDb` 會自動重開） |
+
+寫入以 `message_id` 唯一索引去重，重複擷取不會產生重複列。
+
+---
+
+## 工具
+
+| 工具 | 參數 | 說明 |
 |---|---|---|
-| `detmem.search` | `{ query: string, limit?: number }` | 搜尋決定性記憶。回傳 `transcripts`（含 FTS5 snippet `【...】`）與 `facts`（規則式事實）。 |
-| `detmem.list_facts` | `{ kind?: "decision" \| "todo" \| "preference" \| "convention", limit?: number }` | 列出規則式 Facts。可依 `kind` 篩選，按時間倒序。 |
-| `detmem.stats` | `{}` | 顯示統計：`transcripts`、`facts` 筆數、`dbPath`。 |
+| `detmem_search` | `{ query: string, limit?: number }` | 同時回傳 `transcripts`（FTS5 snippet `【…】`）與 `facts` |
+| `detmem_list_facts` | `{ kind?: "decision" \| "todo" \| "preference" \| "convention", limit?: number }` | 列出事實，可依 kind 篩選 |
+| `detmem_stats` | `{}` | `transcripts` / `fts` / `facts` 筆數、`inSync` 一致性、`dbPath` |
 
-### 使用範例
+`inSync` 必須為 `true`；為 `false` 代表 FTS 索引與 `transcripts` 對不上。
+**重開外掛即可修復**——`migrate` 每次開啟都會比對兩邊筆數，把缺漏的鏡射列補回；
+舊的 `unicode61` 索引則會整個重建為 `trigram`。這兩件事都由 `PRAGMA busy_timeout = 5000` 保護，
+多個 opencode server 同時寫入時會等待而不是直接報錯。
 
-```text
-# 搜尋過去相關討論
-呼叫 detmem.search，query="TypeScript Vite"
+---
 
-# 列出所有 TODO
-呼叫 detmem.list_facts，kind="todo"
+## 選項
 
-# 檢查統計
-呼叫 detmem.stats
-```
+| 選項 | 預設 | 說明 |
+|---|---|---|
+| `dbPath` | `~/.opencode-detmem/detmem.sqlite` | 資料庫位置，父目錄會自動建立 |
+| `debug` | `false` | 開啟檔案除錯日誌 |
+| `debugFile` | `<dbPath 旁邊>/detmem.log` | 除錯日誌路徑 |
 
-## 規則式 Facts 抽取（Patterns）
+> **為什麼需要檔案日誌？** V2 外掛的 `console.error` 不會寫進 `~/.local/share/opencode/log`，
+> 除錯時完全看不到輸出。除錯請用 `"debug": true` 並看 `detmem.log`。
 
-以下正則模式會自動被偵測並存入 `facts` 表（`kind` 對應如下）：
+---
+
+## 規則式 Facts 抽取
 
 | 偵測模式 | kind | confidence |
 |---|---|---|
-| `^(決定|Decision|DECISION)[:：]\s*(.+)$` | `decision` | 0.90 |
-| `^(TODO|待辦|ToDo)[:：]\s*(.+)$` | `todo` | 0.85 |
-| `^(偏好|Preference|偏愛)[:：]\s*(.+)$` | `preference` | 0.85 |
-| `^(慣例|Convention|規則)[:：]\s*(.+)$` | `convention` | 0.88 |
-| `(?:建議使用|use|採用)\s+([A-Za-z0-9_\-./@]+(?:\s*,\s*[A-Za-z0-9_\-./@]+)*)` | `convention` | 0.70 |
+| `^(?:決定|Decision|DECISION)[:：]\s*(.+)$` | `decision` | 0.90 |
+| `^(?:TODO|待辦|ToDo)[:：]\s*(.+)$`（不分大小寫） | `todo` | 0.85 |
+| `^(?:偏好|Preference)[:：]\s*(.+)$`（不分大小寫） | `preference` | 0.85 |
+| `^(?:慣例|Convention|規則)[:：]\s*(.+)$`（不分大小寫） | `convention` | 0.88 |
+| `(?:建議使用|採用|use)\s+([^\s,;]+)`，且該詞像技術名 | `convention` | 0.70 |
 
-> 這些是純規則、決定性，不會有幻覺（Hallucination）。你也可以直接在對話中用這些標籤讓它自動結構化記錄。
+最後一條有兩道關卡：單次抽取最多 20 筆，且該詞必須通過 `looksLikeTech`（含 `.` `:` `_` `-` `/` `@`，
+或**含任何大寫字母**——注意實際判定是 `/[A-Z]/`，所以 `Node`、`Tuesday` 也會通過，
+只有純小寫的英文字（`the`、`use`）才會被視為散文。中文則只要長度 >= 2 就通過。
+這是必要的：`use` 是文中最常見的英文字，若不加檢查，它會把 `use the` 的 `the`
+當成「建議使用的技術」存進資料庫——實測曾因此讓事實表累積 135 筆垃圾。
+
+另外 `opencode run` 送出的 prompt 會被伺服器用**字面雙引號包起來**儲存，
+所以行首實際是 `"決定：…` 而非 `決定：…`。抽取前會去除行首行尾的引號與項目符號，
+否則所有 CLI 來源的決定都會漏掉。
+
+---
+
+## 中文檢索：為什麼用 trigram
+
+SQLite FTS5 預設的 `unicode61` **完全無法切分中文**——整句話會被當成一個 token，
+實測查詢「資料庫」在 `unicode61` 索引下命中 0 筆。
+
+因此索引改用 `trigram`，並在查詢時把中文連續字串展開成重疊的三元組：
+
+```text
+buildFtsQuery("資料庫遷移")
+  → "資料庫" OR "料庫遷" OR "庫遷移"
+```
+
+trigram 無法匹配**少於 3 個字元**的詞，所以另外保留一條 LIKE 備援路徑（取最長的連續字串）。
+
+兩路是**依序串接**、並不重新混排：FTS 結果維持 SQL 內的 bm25 排序，LIKE-only 的結果依 `ts DESC`
+接在後面。因此一個很舊的 LIKE 命中不會壓過 FTS 命中——這是刻意的，因為 LIKE 那一路沒辦法為它的
+結果算 bm25 分數。`%`、`_`、`\` 在 LIKE 樣式中都會被逸出，否則 `a_c` 會連 `aXc` 一起命中。
+
+FTS5 的語法字元（`"`, `*`, `(`, `-`, `OR` …）在組 query 前一律中性化，
+惡意輸入只會退化成「查不到」，不會讓整個查詢丟例外。
+
+---
 
 ## 資料庫結構
 
 ```sql
--- 原始 Transcript
 CREATE TABLE transcripts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT,          -- OpenCode 訊息 ID，唯一索引，去重用
   session_id TEXT NOT NULL,
   title TEXT,
   ts TEXT NOT NULL,
   role TEXT NOT NULL,
   content TEXT NOT NULL,
   tool TEXT,
-  synthetic INTEGER NOT NULL DEFAULT 0
+  synthetic INTEGER NOT NULL DEFAULT 0,
+  project_dir TEXT
 );
 
--- FTS5 全文檢索（BM25）
 CREATE VIRTUAL TABLE transcripts_fts USING fts5(
   content,
-  session_id UNINDEXED,
-  role UNINDEXED,
-  ts UNINDEXED,
-  tokenize = 'unicode61'
+  session_id UNINDEXED, role UNINDEXED, ts UNINDEXED,
+  tokenize = 'trigram'
 );
 
--- 規則式 Facts
 CREATE TABLE facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL,        -- decision/todo/preference/convention
+  kind TEXT NOT NULL,        -- decision / todo / preference / convention
   key TEXT NOT NULL,
   value TEXT NOT NULL,
   scope TEXT NOT NULL DEFAULT 'project',
@@ -218,78 +202,72 @@ CREATE TABLE facts (
 );
 ```
 
-使用 `WAL`（Write-Ahead Logging）模式，效能與穩定性較好。
+- WAL 模式，讀寫不互相阻塞。
+- `facts` 上有 `(kind, key, scope, COALESCE(project_dir,''))` 唯一索引——是**運算式索引**，因為 SQLite 在唯一索引中視 NULL 為相異，不加 `COALESCE` 會讓每個沒有專案目錄的列都插得進來。事實代表**當前狀態**而非稽核紀錄，
+  重複擷取只會更新既有列（最新值勝出），不會無限增生。
+- 舊版資料庫會自動升級：補上缺少的欄位、替換 `unicode61` 索引為 `trigram` 並回填。
+  索引**只在確定缺失或過期時**才重建，避免每次啟動 OpenCode 都阻塞數秒。
 
-## 驗證步驟
+---
 
-### 1. 確認 Plugin 載入
+## 測試
 
 ```bash
-opencode plugin list | grep detmem
+npm test          # 50 項單元/整合測試，真實 SQLite，無 mock
+npm run test:bun  # 同上，在 Bun（OpenCode 的 runtime）下驗證
+npm run test:system
 ```
 
-### 2. 產生測試對話
+`test:system` 是端對端測試：真的啟動 `opencode run` 對話，斷言 prompt 確實被寫入資料庫、
+可被檢索、且能抽出 facts。因為需要外掛已安裝且會實際呼叫模型，預設不執行。
 
-開啟 `opencode`，輸入：
+> 系統測試斷言的是**含有該次專屬隨機標記的那一列**，而不是「總列數增加」。
+> 開發者自己正在被擷取的 session 會不斷寫入同一個資料庫，只看總數會得到假陽性。
 
-```text
-決定：這個專案先用 TypeScript + Vite
-TODO：明天補寫單元測試
-慣例：API 請求統一放在 services/ 資料夾
-建議使用 zod 做 schema 驗證
-```
+---
 
-等待 30–60 秒讓 Session 進入 `idle`（自動觸發 Capture）。
+## OpenCode V2 API 實測筆記
 
-### 3. 檢查統計
+前一版外掛是照著 V1 寫的，載入成功但**完全沒有作用**。以下每一點都是對著 live server 量出來的，
+因為 V2 的 SDK 型別宣告與實際 runtime **不一致**（`@opencode-ai/plugin` 套件裡甚至找不到
+`session` / `event` / `tool` 這些實際存在的 API）：
 
-在對話中呼叫：
+| 項目 | V1 / 文件寫的 | V2.0.20 實測 |
+|---|---|---|
+| 設定來源 | `ctx.config` | `ctx.options` |
+| 訂閱事件 | `ctx.event.subscribe(callback)` | 回傳 AsyncIterable，必須 `for await` |
+| 事件資料 | `event.properties` | `event.data`（`properties` 是 `undefined`） |
+| 取得訊息 | `ctx.client.session.messages()` | `ctx.session.context({ sessionID })` |
+| 訊息結構 | `{ info, parts }` | **扁平陣列**，角色在 `entry.type` |
+| 使用者文字 | `parts[].text` | `entry.text`（字串） |
+| 助理文字 | `parts[].text` | `entry.content[].text` |
+| 時間 | ISO 字串 | `entry.time.created`（epoch 毫秒） |
+| 對話結束 | `session.idle` | **從不發出**（實測 0 次）；改用 `session.step.ended` |
+| 仍會訂閱 | — | `CAPTURE_EVENTS` 仍含 `session.compacted` 與 `session.idle`，只是實測收不到 |
+| 註冊工具 | `ctx.tool.register` | `ctx.tool.transform(editor => …)` |
+| 工具命名 | `editor.namespace()` | 無效果，工具會以裸名稱曝露 |
 
-```text
-呼叫 detmem.stats
-```
+最後一項尤其重要：`editor.namespace()` 不在 SDK 型別裡，實測也不會套用前綴，
+工具會以 `search`、`stats` 這種通用名稱註冊，可能**覆蓋同名內建工具**。
+因此本專案直接用具體前綴命名（`detmem_search` 等）。
 
-或直接使用 Tool：應該看到 `transcripts > 0`、`facts > 0`。
+`ctx.session.context()` 的回傳陣列裡還包含 `type: "idle"` 的標記項目，用來表示一輪結束；
+它沒有文字內容，會被自動略過。
 
-### 4. 測試搜尋
-
-```text
-呼叫 detmem.search，query="Vite"
-呼叫 detmem.search，query="zod"
-呼叫 detmem.search，query="services"
-```
-
-應回傳包含 `【...】` FTS Snippet 的結果。
-
-### 5. 測試 Context 自動注入
-
-開新 Session，輸入：
-
-```text
-這個專案要用什麼打包工具？
-```
-
-觀察第一段回應前是否自動帶入 `# Deterministic Memory (detmem)` 區塊（包含相關 Facts 與 Snippets）。有帶入即代表 `prompt` hook 自動注入正常運作。
-
-## 安全性與隱私
-
-- **完全本機**：所有資料只存在 `~/.opencode-detmem/detmem.sqlite`，不會傳送到任何外部服務。
-- **決定性過濾**：預設過濾 `thought`、`tool_call`、`tool_result`、`synthetic` 訊息，只儲存可讀對話，避免汙染記憶庫。
-- **零追蹤**：無 Telemetry、無 Analytics、無外部請求。
+---
 
 ## 疑難排解
 
-| 問題 | 解法 |
+| 問題 | 處理方式 |
 |---|---|
-| `sqlite3: command not found` | 安裝 SQLite CLI（`brew install sqlite3` 或系統已預裝 macOS 一般都有）。 |
-| Plugin 沒出現在 `plugin list` | 檢查路徑 `~/.config/opencode/plugins/detmem/index.js` 是否存在，執行 `opencode service restart` 後再確認。 |
-| Capture 沒有觸發（transcripts 為 0） | OpenCode 需進入 `session.idle` 才會觸發。可多做幾輪對話後靜置 30–60 秒，或手動呼叫 `detmem.stats` 等待片刻再檢查。 |
-| Context 沒有自動注入 | 僅在**使用者 Prompt** 送出前觸發（`prompt` hook）。Agent 自主思考的內部步驟不會觸發。確認是在新 Session 且輸入使用者問題時測試。 |
+| 沒看到外掛載入 | 確認用的是 `plugins` 陣列而非複製到 `plugins/` 目錄；接著 `opencode service restart` |
+| 看不到任何日誌 | 開 `"debug": true`，再看 `~/.opencode-detmem/detmem.log` |
+| `transcripts` 一直是 0 | 先確認 `detmem_stats` 能回應（代表外掛有載入）；再看 `detmem.log` 是否有 `capture` 行 |
+| 搜尋中文沒結果 | 確認 `inSync` 為 `true`；`false` 時重開外掛會自動補齊，舊的 `unicode61` 索引也會重建為 `trigram` |
+| 事實表出現無意義內容 | 對應到 `decision` / `todo` 等標記行，屬預期行為；`convention` 已過濾英文虛詞 |
+
+---
 
 ## 授權
 
-MIT License
-
-## 版本
-
-v2.0.0 — 專為 OpenCode V2 設計，Zero LLM、自動 Capture、FTS5 + 規則式 Facts。
+MIT
