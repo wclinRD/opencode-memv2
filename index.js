@@ -7,10 +7,10 @@
  * - Injects top-K relevant memories into chat context
  */
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import path from "node:path";
-import os from "node:os";
+import * as path from "node:path";
+import * as os from "node:os";
 import { spawn } from "node:child_process";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".opencode-detmem");
@@ -226,9 +226,10 @@ async function searchRelevant(dbPath, query, limit = 8) {
 }
 
 async function captureSession(ctx, sessionId) {
-  const dbPath = ctx.config.dbPath || DEFAULT_DB_PATH;
+  const dbPath = ctx.config?.dbPath || ctx.options?.dbPath || DEFAULT_DB_PATH;
   await initDb(dbPath);
   try {
+    if (!ctx.client?.session?.messages) return { ok: false, error: "ctx.client.session.messages not available" };
     const res = await ctx.client.session.messages({ path: { id: sessionId } });
     const msgs = res.messages || [];
     let stored = 0;
@@ -272,84 +273,92 @@ export default {
   id: "detmem",
   name: "Deterministic Memory",
   async setup(ctx) {
-    const dbPath = ctx.config.dbPath || DEFAULT_DB_PATH;
+    const dbPath = ctx.config?.dbPath || ctx.options?.dbPath || DEFAULT_DB_PATH;
     await initDb(dbPath);
 
     // Auto-capture on session lifecycle events
-    ctx.event.subscribe(async (ev) => {
-      try {
-        const t = ev?.event?.type || ev?.type;
-        if (t === "session.idle" || t === "session.compacted" || t === "session.updated") {
-          const sid = ev?.event?.sessionID || ev?.sessionID || ev?.properties?.sessionID || ev?.properties?.id;
-          if (sid) {
-            await captureSession(ctx, sid);
+    try {
+      ctx.event.subscribe(async (ev) => {
+        try {
+          const t = ev?.event?.type || ev?.type || ev?.name;
+          if (t === "session.idle" || t === "session.compacted" || t === "session.updated" || t === "session.idle.changed" || t === "session.idle.update") {
+            const sid = ev?.event?.sessionID || ev?.event?.sessionId || ev?.sessionID || ev?.sessionId || ev?.properties?.sessionID || ev?.properties?.id || ev?.id;
+            if (sid) {
+              await captureSession(ctx, sid);
+            }
           }
-        }
-      } catch (e) {}
-    });
+        } catch (e) {}
+      });
+    } catch (e) {}
 
     // Inject relevant memory before prompt
-    ctx.session.hook("prompt", async (input) => {
-      try {
-        const prompt = input.prompt || "";
-        const q = prompt.slice(0, 120);
-        const rel = await searchRelevant(dbPath, q, 8);
-        const block = formatContextBlock(rel);
-        if (block) {
-          input.prompt = block + "\n\n---\n\n" + prompt;
-        }
-      } catch (e) {}
-      return input;
-    });
+    try {
+      if (ctx.session?.hook) {
+        ctx.session.hook("prompt", async (input) => {
+          try {
+            const prompt = input.prompt || "";
+            const q = prompt.slice(0, 160);
+            const rel = await searchRelevant(dbPath, q, 8);
+            const block = formatContextBlock(rel);
+            if (block) {
+              input.prompt = block + "\n\n---\n\n" + prompt;
+            }
+          } catch (e) {}
+          return input;
+        });
+      }
+    } catch (e) {}
 
     // Manual tools
-    ctx.tool.register({
-      id: "detmem.search",
-      description: "Search deterministic memory (FTS5 + facts)",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          limit: { type: "number", default: 10 },
+    try {
+      ctx.tool.register({
+        id: "detmem.search",
+        description: "Search deterministic memory (FTS5 + facts)",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            limit: { type: "number", default: 10 },
+          },
+          required: ["query"],
         },
-        required: ["query"],
-      },
-      async execute({ query, limit = 10 }) {
-        const rel = await searchRelevant(dbPath, query, limit);
-        return { ok: true, ...rel };
-      },
-    });
-
-    ctx.tool.register({
-      id: "detmem.list_facts",
-      description: "List rule-based facts",
-      parameters: {
-        type: "object",
-        properties: {
-          kind: { type: "string" },
-          limit: { type: "number", default: 20 },
+        async execute({ query, limit = 10 }) {
+          const rel = await searchRelevant(dbPath, query, limit);
+          return { ok: true, ...rel };
         },
-      },
-      async execute({ kind, limit = 20 }) {
-        let sql = "SELECT id,kind,key,value,scope,confidence,ts FROM facts";
-        const params = [];
-        if (kind) { sql += " WHERE kind=?"; params.push(kind); }
-        sql += " ORDER BY ts DESC LIMIT ?";
-        params.push(limit);
-        const r = await runSqlite(dbPath, sql, params);
-        return { ok: r.ok, facts: r.rows || [] };
-      },
-    });
+      });
 
-    ctx.tool.register({
-      id: "detmem.stats",
-      description: "Deterministic memory stats",
-      parameters: { type: "object", properties: {} },
-      async execute() {
-        const r1 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM transcripts;");
-        const r2 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM facts;");
-        return { ok: true, transcripts: r1.rows?.[0]?.c || 0, facts: r2.rows?.[0]?.c || 0, dbPath };
-      },
-    });
+      ctx.tool.register({
+        id: "detmem.list_facts",
+        description: "List rule-based facts",
+        parameters: {
+          type: "object",
+          properties: {
+            kind: { type: "string" },
+            limit: { type: "number", default: 20 },
+          },
+        },
+        async execute({ kind, limit = 20 }) {
+          let sql = "SELECT id,kind,key,value,scope,confidence,ts FROM facts";
+          const params = [];
+          if (kind) { sql += " WHERE kind=?"; params.push(kind); }
+          sql += " ORDER BY ts DESC LIMIT ?";
+          params.push(limit);
+          const r = await runSqlite(dbPath, sql, params);
+          return { ok: r.ok, facts: r.rows || [] };
+        },
+      });
+
+      ctx.tool.register({
+        id: "detmem.stats",
+        description: "Deterministic memory stats",
+        parameters: { type: "object", properties: {} },
+        async execute() {
+          const r1 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM transcripts;");
+          const r2 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM facts;");
+          return { ok: true, transcripts: r1.rows?.[0]?.c || 0, facts: r2.rows?.[0]?.c || 0, dbPath };
+        },
+      });
+    } catch (e) {}
   },
 };
