@@ -233,3 +233,49 @@ test("stats reports real counts and consistency", () => {
   assert.equal(s.fts, s.transcripts);
   assert.equal(s.inSync, true);
 });
+
+test("listFacts survives argument types a language model might produce", () => {
+  const p = path.join(dir, "list-args.sqlite");
+  storeFacts(p, [{ kind: "decision", key: "k", value: "v", confidence: 0.9 }], {});
+
+  // Every one of these reached SQLite as a bound value before, and came back as
+  // "datatype mismatch" — a failed tool call rather than a clamped result.
+  for (const kind of [{}, [], 42, true, "", null, undefined, "decision"]) {
+    assert.doesNotThrow(() => listFacts(p, { kind }), `kind=${JSON.stringify(kind)}`);
+  }
+  for (const limit of [null, 1.9, 0, -3, NaN, "5", undefined]) {
+    assert.doesNotThrow(() => listFacts(p, { kind: "decision", limit }), `limit=${String(limit)}`);
+  }
+  assert.doesNotThrow(() => listFacts(p, null), "a null options object");
+  assert.equal(listFacts(p, { kind: "decision", limit: 1.9 }).length, 1, "fractional limit falls back");
+});
+
+test("storeFacts writes a whole fact set or none of it", () => {
+  const p = path.join(dir, "facts-atomic.sqlite");
+  storeFacts(p, [{ kind: "decision", key: "good1", value: "a", confidence: 0.9 }], {});
+
+  // `value: undefined` cannot be bound, so the batch throws partway. Without a
+  // transaction the first row would already be committed.
+  assert.throws(() =>
+    storeFacts(
+      p,
+      [
+        { kind: "decision", key: "good2", value: "b", confidence: 0.9 },
+        { kind: "decision", key: "bad", value: undefined, confidence: 0.9 },
+      ],
+      {},
+    ),
+  );
+
+  const keys = listFacts(p, { limit: 50 }).map((r) => r.key);
+  assert.deepEqual(keys, ["good1"], "the successful row from this batch was rolled back");
+});
+
+test("storeMessage writes the row and its FTS mirror together", () => {
+  const p = path.join(dir, "mirror-atomic.sqlite");
+  storeMessage(p, msg({ messageId: "m1", content: "有內容的記憶" }));
+  const s = stats(p);
+  assert.equal(s.transcripts, 1);
+  assert.equal(s.fts, 1, "the mirror row landed in the same transaction");
+  assert.equal(s.inSync, true);
+});

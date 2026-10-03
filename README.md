@@ -216,7 +216,7 @@ CREATE TABLE facts (
 ## 測試
 
 ```bash
-npm test          # 52 項單元/整合測試，真實 SQLite，無 mock
+npm test          # 55 項單元/整合測試，真實 SQLite，無 mock
 npm run test:bun  # 同上，在 Bun（OpenCode 的 runtime）下驗證
 npm run test:system
 ```
