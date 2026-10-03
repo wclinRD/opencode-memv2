@@ -233,6 +233,3 @@ test("stats reports real counts and consistency", () => {
   assert.equal(s.fts, s.transcripts);
   assert.equal(s.inSync, true);
 });
-
-
-

@@ -162,3 +162,41 @@ test("an FTS index that is healthy but incomplete is repaired on open", () => {
   const hit = searchMemory(p, "第二筆", 5, buildFtsQuery("第二筆"), buildLikeNeedle("第二筆"));
   assert.ok(hit.transcripts.length > 0, "the repaired row is searchable again");
 });
+
+test("an FTS row whose transcript is gone is deleted on open", () => {
+  // stats().inSync folds orphanFts in, so leaving orphans makes the state exactly
+  // as unrecoverable as a missing row — and the repair shares ftsDrift() with the
+  // diagnostic precisely so the two cannot disagree.
+  const p = path.join(dir, "orphan-fts.sqlite");
+  storeMessage(p, { messageId: "a", sessionId: "s", ts: "2026-01-01T00:00:00.000Z", role: "user", content: "留下來的記憶" });
+  storeMessage(p, { messageId: "b", sessionId: "s", ts: "2026-01-02T00:00:00.000Z", role: "user", content: "要被刪掉的那筆" });
+
+  getDb(p).exec("DELETE FROM transcripts WHERE message_id = 'b'");
+  assert.equal(stats(p).orphanFts, 1, "precondition: the mirror row is orphaned");
+  assert.equal(stats(p).inSync, false);
+
+  closeAll();
+  const after = stats(p);
+  assert.equal(after.orphanFts, 0, "the orphan is removed");
+  assert.equal(after.missingFts, 0);
+  assert.equal(after.inSync, true);
+  assert.equal(after.transcripts, 1);
+});
+
+test("the repair and stats agree even when an empty row is mirrored", () => {
+  // A plain pair of totals balances here (2 mirrored vs 2 non-empty) while a real
+  // row is still unmirrored, which is how a count-based guard skipped repairs that
+  // stats() kept reporting.
+  const p = path.join(dir, "count-skew.sqlite");
+  storeMessage(p, { messageId: "a", sessionId: "s", ts: "2026-01-01T00:00:00.000Z", role: "user", content: "有內容" });
+  storeMessage(p, { messageId: "b", sessionId: "s", ts: "2026-01-02T00:00:00.000Z", role: "user", content: "有內容" });
+  const db = getDb(p);
+  // Simulate an older revision that mirrored a transcript whose content is now empty.
+  db.exec("UPDATE transcripts SET content = '' WHERE message_id = 'b'");
+  db.exec("DELETE FROM transcripts_fts WHERE rowid = (SELECT id FROM transcripts WHERE message_id = 'a')");
+
+  assert.equal(stats(p).missingFts, 1, "the precise predicate sees the gap a count would miss");
+  closeAll();
+  assert.equal(stats(p).missingFts, 0, "repaired");
+  assert.equal(stats(p).inSync, true);
+});

@@ -103,9 +103,11 @@ TODO：補上 system test
 | `detmem_stats` | `{}` | `transcripts` / `fts` / `facts` 筆數、`inSync` 一致性、`dbPath` |
 
 `inSync` 必須為 `true`；為 `false` 代表 FTS 索引與 `transcripts` 對不上。
-**重開外掛即可修復**——`migrate` 每次開啟都會比對兩邊筆數，把缺漏的鏡射列補回；
-舊的 `unicode61` 索引則會整個重建為 `trigram`。這兩件事都由 `PRAGMA busy_timeout = 5000` 保護，
-多個 opencode server 同時寫入時會等待而不是直接報錯。
+**重開外掛即可修復**——`migrate` 每次開啟都會用與本表**完全相同**的判準（`ftsDrift()`）
+檢查索引，缺漏的鏡射列補回、孤兒列刪除；舊的 `unicode61` 索引則整個重建為 `trigram`。
+因為修復與診斷共用同一組判準，`inSync: false` 不可能出現「修不好」的狀態。
+寫入端設有 `PRAGMA busy_timeout = 5000`：`setup()` 每個專案目錄各跑一次，多個實例
+（或第二個 opencode server）會競爭同一個檔案，這讓寫入最多等 5 秒再報錯。
 
 ---
 
@@ -133,8 +135,9 @@ TODO：補上 system test
 | `(?:建議使用|採用|use)\s+([^\s,;]+)`，且該詞像技術名 | `convention` | 0.70 |
 
 最後一條有兩道關卡：單次抽取最多 20 筆，且該詞必須通過 `looksLikeTech`（含 `.` `:` `_` `-` `/` `@`，
-或**含任何大寫字母**——注意實際判定是 `/[A-Z]/`，所以 `Node`、`Tuesday` 也會通過，
-只有純小寫的英文字（`the`、`use`）才會被視為散文。中文則只要長度 >= 2 就通過。
+或**含任何大寫字母**——實際判定是 `/[A-Z]/`，所以 `Node`、`Tuesday` 也會通過。
+純小寫的英文字被視為散文而排除（`/^[a-z0-9]+$/`，所以 `utf8`、`v2` 也不行）。
+中文則只要落在 `U+3400–U+9FFF` 且長度 >= 2 就通過——注音、韓文與 CJK 擴充區不涵蓋在內。
 這是必要的：`use` 是文中最常見的英文字，若不加檢查，它會把 `use the` 的 `the`
 當成「建議使用的技術」存進資料庫——實測曾因此讓事實表累積 135 筆垃圾。
 
@@ -213,7 +216,7 @@ CREATE TABLE facts (
 ## 測試
 
 ```bash
-npm test          # 50 項單元/整合測試，真實 SQLite，無 mock
+npm test          # 52 項單元/整合測試，真實 SQLite，無 mock
 npm run test:bun  # 同上，在 Bun（OpenCode 的 runtime）下驗證
 npm run test:system
 ```
@@ -263,7 +266,7 @@ npm run test:system
 | 沒看到外掛載入 | 確認用的是 `plugins` 陣列而非複製到 `plugins/` 目錄；接著 `opencode service restart` |
 | 看不到任何日誌 | 開 `"debug": true`，再看 `~/.opencode-detmem/detmem.log` |
 | `transcripts` 一直是 0 | 先確認 `detmem_stats` 能回應（代表外掛有載入）；再看 `detmem.log` 是否有 `capture` 行 |
-| 搜尋中文沒結果 | 確認 `inSync` 為 `true`；`false` 時重開外掛會自動補齊，舊的 `unicode61` 索引也會重建為 `trigram` |
+| 搜尋中文沒結果 | 確認 `inSync` 為 `true`；`false` 時重開外掛會自動補齊或刪除多餘的鏡射列，舊的 `unicode61` 索引也會重建為 `trigram` |
 | 事實表出現無意義內容 | 對應到 `decision` / `todo` 等標記行，屬預期行為；`convention` 已過濾英文虛詞 |
 
 ---
