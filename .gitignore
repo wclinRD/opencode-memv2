@@ -1,0 +1,21 @@
+# Local database
+.opencode-detmem/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Node
+node_modules/
+.DS_Store
+*.log
+dist/
+build/
+.env
+.env.local
+.nyc_output/
+coverage/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
