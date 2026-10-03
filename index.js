@@ -172,16 +172,17 @@ async function storeTranscript(dbPath, sessionId, title, msg) {
   fullText = fullText.trim();
   if (!fullText) return { stored: 0 };
   const ts = msg.timestamp ? new Date(msg.timestamp).toISOString() : nowIso();
-  await runSqlite(
-    dbPath,
-    `INSERT INTO transcripts (session_id,title,ts,role,content,tool,synthetic) VALUES (?,?,?,?,?,?,?);`,
-    [sessionId, title || null, ts, role, fullText, tool, synthetic]
-  );
-  await runSqlite(
-    dbPath,
-    `INSERT INTO transcripts_fts (rowid, content, session_id, role, ts) VALUES ((SELECT id FROM transcripts WHERE session_id=? AND ts=? AND content=? ORDER BY id DESC LIMIT 1), ?, ?, ?, ?);`,
-    [sessionId, ts, fullText, fullText, sessionId, role, ts]
-  );
+  const sql = `
+BEGIN TRANSACTION;
+INSERT INTO transcripts (session_id,title,ts,role,content,tool,synthetic) VALUES (?,?,?,?,?,?,?);
+INSERT INTO transcripts_fts (rowid, content, session_id, role, ts) VALUES (last_insert_rowid(), ?, ?, ?, ?);
+COMMIT;
+`;
+  const params = [
+    sessionId, title || null, ts, role, fullText, tool, synthetic,
+    fullText, sessionId, role, ts,
+  ];
+  await runSqlite(dbPath, sql, params);
   return { stored: 1, text: fullText };
 }
 
@@ -225,8 +226,17 @@ async function searchRelevant(dbPath, query, limit = 8) {
   return { transcripts, facts };
 }
 
+const lastCapture = new Map();
 async function captureSession(ctx, sessionId) {
   const dbPath = ctx.config?.dbPath || ctx.options?.dbPath || DEFAULT_DB_PATH;
+  const now = Date.now();
+  if (sessionId) {
+    const k = sessionId;
+    if (lastCapture.has(k) && (now - lastCapture.get(k)) < 5 * 60 * 1000) {
+      return { ok: true, skipped: true, reason: "throttled" };
+    }
+    lastCapture.set(k, now);
+  }
   await initDb(dbPath);
   try {
     if (!ctx.client?.session?.messages) return { ok: false, error: "ctx.client.session.messages not available" };
@@ -292,16 +302,23 @@ export default {
     } catch (e) {}
 
     // Inject relevant memory before prompt
+    const lastInject = { q: "", ts: 0 };
     try {
       if (ctx.session?.hook) {
         ctx.session.hook("prompt", async (input) => {
           try {
             const prompt = input.prompt || "";
-            const q = prompt.slice(0, 160);
+            const q = (prompt.slice(0, 160) || "").trim();
+            const now = Date.now();
+            if (q && q === lastInject.q && (now - lastInject.ts) < 60_000) {
+              return input;
+            }
             const rel = await searchRelevant(dbPath, q, 8);
             const block = formatContextBlock(rel);
             if (block) {
               input.prompt = block + "\n\n---\n\n" + prompt;
+              lastInject.q = q;
+              lastInject.ts = now;
             }
           } catch (e) {}
           return input;
@@ -357,6 +374,27 @@ export default {
           const r1 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM transcripts;");
           const r2 = await runSqlite(dbPath, "SELECT COUNT(*) AS c FROM facts;");
           return { ok: true, transcripts: r1.rows?.[0]?.c || 0, facts: r2.rows?.[0]?.c || 0, dbPath };
+        },
+      });
+
+      ctx.tool.register({
+        id: "detmem.cleanup",
+        description: "Cleanup old deterministic memory (by days)",
+        parameters: {
+          type: "object",
+          properties: {
+            days: { type: "number", default: 90, minimum: 1, maximum: 3650 },
+          },
+        },
+        async execute({ days = 90 }) {
+          const cutoff = new Date(Date.now() - days * 864e5).toISOString();
+          const dp = dbPath;
+          await runSqlite(dp, `DELETE FROM transcripts WHERE ts < ?;`, [cutoff]);
+          await runSqlite(dp, `DELETE FROM facts WHERE ts < ?;`, [cutoff]);
+          await runSqlite(dp, `INSERT INTO transcripts_fts(transcripts_fts) VALUES('optimize');`);
+          const r1 = await runSqlite(dp, "SELECT COUNT(*) AS c FROM transcripts;");
+          const r2 = await runSqlite(dp, "SELECT COUNT(*) AS c FROM facts;");
+          return { ok: true, cutoff, transcriptsAfter: r1.rows?.[0]?.c || 0, factsAfter: r2.rows?.[0]?.c || 0 };
         },
       });
     } catch (e) {}

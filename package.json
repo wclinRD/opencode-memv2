@@ -1,0 +1,12 @@
+{
+  "name": "opencode-memv2",
+  "version": "2.0.1",
+  "type": "module",
+  "description": "Deterministic memory plugin for OpenCode v2 (zero LLM, SQLite FTS5, auto-capture)",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wclinRD/opencode-memv2.git"
+  },
+  "license": "MIT"
+}
