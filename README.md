@@ -116,11 +116,25 @@ TODO：補上 system test
 | 選項 | 預設 | 說明 |
 |---|---|---|
 | `dbPath` | `~/.opencode-detmem/detmem.sqlite` | 資料庫位置，父目錄會自動建立 |
-| `debug` | `false` | 開啟檔案除錯日誌 |
+| `debug` | `false` | 開啟檔案除錯日誌。**預設關閉**，開著會持續寫檔且不會自動輪替 |
 | `debugFile` | `<dbPath 旁邊>/detmem.log` | 除錯日誌路徑 |
 
 > **為什麼需要檔案日誌？** V2 外掛的 `console.error` 不會寫進 `~/.local/share/opencode/log`，
-> 除錯時完全看不到輸出。除錯請用 `"debug": true` 並看 `detmem.log`。
+> 除錯時完全看不到輸出。要排查問題時才開 `"debug": true`，看 `detmem.log`，
+> 解決後把它關回去——日誌會一直成長。
+
+### 清空記憶
+
+要從零開始（換專案、忘記曾記錄的內容、或除錯後想清掉雜訊），
+停掉服務後刪掉整個資料庫即可；外掛下次啟動會自動重建 schema：
+
+```bash
+rm -f ~/.opencode-detmem/detmem.sqlite*
+rm -f ~/.opencode-detmem/detmem.log
+opencode service restart
+```
+
+這是**不可逆**的， transcripts 與 facts 一併刪除。
 
 ---
 
